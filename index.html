@@ -36,10 +36,10 @@
     const { useState, useMemo, useEffect } = React;
 
     const INITIAL_ASSETS = [
-      { id: '1', symbol: '0050', shares: 20000, price: 0, targetPct: 10 },
+      { id: '1', symbol: 'VOO', shares: 21.5, price: 0, targetPct: 15 },
       { id: '2', symbol: '00631L', shares: 22000, price: 0, targetPct: 40 },
       { id: '3', symbol: 'QQQ', shares: 8.89, price: 0, targetPct: 25 },
-      { id: '4', symbol: 'VOO', shares: 21.5, price: 0, targetPct: 15 },
+      { id: '4', symbol: '現金', shares: 300000, price: 1, targetPct: 20 },
     ];
 
     const COLORS = ['#4f46e5', '#06b6d4', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6'];
@@ -77,6 +77,9 @@
           const currentExRate = exData.rates.TWD;
 
           const updatedAssets = await Promise.all(assets.map(async (asset) => {
+            if (asset.symbol === '現金' || asset.symbol === 'CASH') {
+              return { ...asset, price: 1 };
+            }
             const isTaiwanStock = /^\d{4,}/.test(asset.symbol);
             const isUSStock = !isTaiwanStock;
             // 避免重複加 .TW
@@ -182,16 +185,41 @@
 
       // --- 3. 處理單一資產「照做」邏輯 ---
       const handleExecuteAction = (assetId, diffShares, action) => {
-        const newAssets = assets.map(a => {
-          if (a.id === assetId) {
-            // 與顯示的邏輯一致：買進無條件進位，賣出無條件捨去
-            const sharesToChange = action === 'BUY' ? Math.ceil(Math.abs(diffShares)) : -Math.floor(Math.abs(diffShares));
-            return { ...a, shares: Math.max(0, a.shares + sharesToChange) };
-          }
-          return a;
-        });
-        // 寫入 Firebase
+        const targetAsset = assets.find(a => a.id === assetId);
+        const cashAsset = assets.find(a => a.symbol === '現金');
+
+        if (!targetAsset || !cashAsset) return;
+
+        let newAssets = [...assets];
+        const sharesToChange = Math.abs(diffShares);
+        const tradeValue = sharesToChange * targetAsset.price;
+
+        if (action === 'BUY') {
+          // 買入：扣除現金，增加股票
+          newAssets = newAssets.map(a => {
+            if (a.id === assetId) return { ...a, shares: a.shares + Math.ceil(sharesToChange) };
+            if (a.id === cashAsset.id) return { ...a, shares: a.shares - Math.round(tradeValue) };
+            return a;
+          });
+        } else {
+          // 賣出：增加現金，扣除股票
+          newAssets = newAssets.map(a => {
+            if (a.id === assetId) return { ...a, shares: Math.max(0, a.shares - Math.floor(sharesToChange)) };
+            if (a.id === cashAsset.id) return { ...a, shares: a.shares + Math.round(tradeValue) };
+            return a;
+          });
+        }
         database.ref('portfolio').set(newAssets);
+      };
+
+      const handleCashAdjustment = (amount) => {
+        const cashAsset = assets.find(a => a.symbol === '現金');
+        if (cashAsset) {
+          const newAssets = assets.map(a => 
+            a.id === cashAsset.id ? { ...a, shares: Math.max(0, a.shares + amount) } : a
+          );
+          database.ref('portfolio').set(newAssets);
+        }
       };
 
       // --- UI 控制邏輯 ---
@@ -354,32 +382,42 @@
                   {rebalanceResult.map((asset) => {
                     const shares = Math.abs(asset.diffShares);
                     const isHold = asset.action === 'HOLD' || shares === 0 || asset.price === 0;
+                    const isCash = asset.symbol === '現金';
                     return (
                       <div key={asset.id} className="flex justify-between items-center p-3 rounded-lg bg-gray-50 border border-gray-100">
                         <div>
                           <div className="font-bold text-sm text-gray-800">{asset.symbol}</div>
                           <div className="text-xs text-gray-400">
-                            差異：<span className={asset.diffVal >= 0 ? "text-emerald-600" : "text-rose-600"}>{asset.diffVal >= 0 ? '+' : ''}${Math.round(asset.diffVal).toLocaleString()}</span>
+                            差異：<span className={asset.diffVal >= 0 ? "text-emerald-600" : "text-rose-600"}>
+                              {asset.diffVal >= 0 ? '+' : ''}${Math.round(asset.diffVal).toLocaleString()}
+                            </span>
                           </div>
                         </div>
+      
                         <div className="text-right">
                           {isHold ? (
                             <span className="text-xs font-semibold px-2 py-1 bg-gray-200 text-gray-600 rounded">維持現狀</span>
                           ) : (
-                            <div className="flex items-center justify-end space-x-3">
-                              {asset.action === 'BUY' ? (
-                                <div className="text-sm font-bold text-emerald-600">買入 <span className="text-base font-black">{Math.ceil(shares).toLocaleString()}</span> 股</div>
+                            <div className="flex items-center justify-end space-x-2">
+            
+                              {/* 🌟 這裡是關鍵：判斷如果是「現金」，顯示加減按鈕，否則顯示「照做」 */}
+                              {isCash ? (
+                                <div className="flex items-center space-x-1">
+                                  <button onClick={() => handleCashAdjustment(-10000)} className="bg-rose-100 text-rose-600 px-2 py-1 rounded text-xs font-bold">-1萬</button>
+                                  <button onClick={() => handleCashAdjustment(10000)} className="bg-emerald-100 text-emerald-600 px-2 py-1 rounded text-xs font-bold">+1萬</button>
+                                </div>
                               ) : (
-                                <div className="text-sm font-bold text-rose-600">賣出 <span className="text-base font-black">{Math.floor(shares).toLocaleString()}</span> 股</div>
+                                <div className="flex items-center space-x-2">
+                                  <div className="text-sm font-bold text-emerald-600">
+                                    {asset.action === 'BUY' ? '買入' : '賣出'} 
+                                    <span className="text-base font-black px-1">{Math.ceil(shares).toLocaleString()}</span>股
+                                  </div>
+                                  <button onClick={() => handleExecuteAction(asset.id, asset.diffShares, asset.action)} 
+                                          className="bg-indigo-100 hover:bg-indigo-600 text-indigo-700 hover:text-white transition-colors px-3 py-1.5 rounded text-xs font-bold shadow-sm">
+                                    照做
+                                  </button>
+                                </div>
                               )}
-                              
-                              {/* 照做按鈕 */}
-                              <button 
-                                onClick={() => handleExecuteAction(asset.id, asset.diffShares, asset.action)}
-                                className="bg-indigo-100 hover:bg-indigo-600 text-indigo-700 hover:text-white transition-colors px-3 py-1.5 rounded text-xs font-bold shadow-sm"
-                              >
-                                照做
-                              </button>
                             </div>
                           )}
                         </div>
