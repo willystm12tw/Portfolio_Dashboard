@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>資產動態平衡儀表板</title>
+  
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+  <script>
+    const firebaseConfig = {
+      apiKey: "AIzaSyBpnOiWvkYUgQ48TckqVTaOXZVeZIocBnY",
+      authDomain: "portfoliodashboard-2c33d.firebaseapp.com",
+      databaseURL: "https://portfoliodashboard-2c33d-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "portfoliodashboard-2c33d",
+      storageBucket: "portfoliodashboard-2c33d.firebasestorage.app",
+      messagingSenderId: "168313835182",
+      appId: "1:168313835182:web:f18521cc34f06f303a273f",
+      measurementId: "G-HDC4Q17S39"
+    };
+    firebase.initializeApp(firebaseConfig);
+    const database = firebase.database();
+  </script>
+</head>
+<body class="bg-gray-100">
+  
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo, useEffect } = React;
+
+    const INITIAL_ASSETS = [
+      { id: '1', symbol: '0050', shares: 20000, price: 0, targetPct: 10 },
+      { id: '2', symbol: '00631L', shares: 22000, price: 0, targetPct: 40 },
+      { id: '3', symbol: 'QQQ', shares: 8.89, price: 0, targetPct: 25 },
+      { id: '4', symbol: 'VOO', shares: 21.5, price: 0, targetPct: 15 },
+    ];
+
+    const COLORS = ['#4f46e5', '#06b6d4', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6'];
+
+    function PortfolioRebalancer() {
+      const [assets, setAssets] = useState(INITIAL_ASSETS);
+      const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+      const [rebalanceMode, setRebalanceMode] = useState('buySell');
+      const [editAssets, setEditAssets] = useState(INITIAL_ASSETS);
+      const [isLoading, setIsLoading] = useState(false);
+      const [lastUpdated, setLastUpdated] = useState(null);
+
+      // --- 2. 監聽 Firebase 資料同步 ---
+      useEffect(() => {
+        const dbRef = database.ref('portfolio');
+        const listener = dbRef.on('value', (snapshot) => {
+          const data = snapshot.val();
+          if (data) {
+            setAssets(data);
+          } else {
+            // 如果雲端沒資料，寫入預設值
+            dbRef.set(INITIAL_ASSETS);
+          }
+        });
+        return () => dbRef.off('value', listener);
+      }, []);
+
+      // --- 股價 API 串接 (包含 1. 匯率計算) ---
+      const fetchRealTimePrices = async () => {
+        setIsLoading(true);
+        try {
+          // 先抓取即時美金匯率
+          const exRes = await fetch('https://api.exchangerate-api.com/v4/latest/USD');
+          const exData = await exRes.json();
+          const currentExRate = exData.rates.TWD;
+
+          const updatedAssets = await Promise.all(assets.map(async (asset) => {
+            const isTaiwanStock = /^\d{4,}/.test(asset.symbol);
+            const isUSStock = !isTaiwanStock;
+            // 避免重複加 .TW
+            const yahooSymbol = isTaiwanStock && !asset.symbol.includes('.TW') ? `${asset.symbol}.TW` : asset.symbol;
+            
+            const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}`;
+            const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
+
+            try {
+              const response = await fetch(proxyUrl);
+              if (!response.ok) throw new Error('Network error');
+              const parsedData = await response.json();
+              if (!parsedData.chart.result) throw new Error('No data');
+              
+              const rawPrice = parsedData.chart.result[0].meta.regularMarketPrice;
+              
+              // 如果是美股，價格直接乘以匯率換算成台幣
+              const finalPrice = isUSStock ? rawPrice * currentExRate : rawPrice;
+              
+              return { ...asset, price: finalPrice };
+            } catch (error) {
+              console.error(`抓取 ${asset.symbol} 股價失敗:`, error);
+              return asset; // 失敗則保留原本價格
+            }
+          }));
+
+          // 將更新後的價格寫入 Firebase 觸發同步
+          database.ref('portfolio').set(updatedAssets);
+          setLastUpdated(new Date().toLocaleTimeString('zh-TW', { hour12: false }));
+        } catch (error) {
+          console.error('更新過程發生錯誤:', error);
+        } finally {
+          setIsLoading(false);
+        }
+      };
+
+      // --- 核心計算邏輯 ---
+      const { totalValue, assetsWithMetrics, rebalanceResult, totalTargetPct, additionalCashNeeded } = useMemo(() => {
+        let total = 0;
+        let targetPctSum = 0;
+        const withValues = assets.map((asset) => {
+          const currentVal = asset.shares * asset.price;
+          total += currentVal;
+          targetPctSum += asset.targetPct;
+          return { ...asset, currentVal };
+        });
+
+        const withMetrics = withValues.map((asset) => ({
+          ...asset,
+          currentPct: total > 0 ? (asset.currentVal / total) * 100 : 0,
+        }));
+
+        let rebalance = [];
+        let extraCash = 0;
+
+        if (rebalanceMode === 'buySell') {
+          rebalance = withMetrics.map((asset) => {
+            const targetVal = total * (asset.targetPct / 100);
+            const diffVal = targetVal - asset.currentVal;
+            const diffShares = asset.price > 0 ? diffVal / asset.price : 0;
+            return {
+              ...asset,
+              targetVal,
+              diffVal,
+              diffShares,
+              action: diffShares >= 0 ? 'BUY' : 'SELL',
+            };
+          });
+        } else {
+          let maxImpliedTotal = total;
+          withMetrics.forEach((asset) => {
+            if (asset.targetPct > 0) {
+              const impliedTotal = asset.currentVal / (asset.targetPct / 100);
+              if (impliedTotal > maxImpliedTotal) {
+                maxImpliedTotal = impliedTotal;
+              }
+            }
+          });
+
+          rebalance = withMetrics.map((asset) => {
+            const targetVal = maxImpliedTotal * (asset.targetPct / 100);
+            const diffVal = targetVal - asset.currentVal;
+            const diffShares = asset.price > 0 ? diffVal / asset.price : 0;
+            extraCash += diffVal;
+            return {
+              ...asset,
+              targetVal,
+              diffVal,
+              diffShares,
+              action: diffShares > 0.01 ? 'BUY' : 'HOLD',
+            };
+          });
+        }
+
+        return {
+          totalValue: total,
+          assetsWithMetrics: withMetrics,
+          rebalanceResult: rebalance,
+          totalTargetPct: targetPctSum,
+          additionalCashNeeded: extraCash,
+        };
+      }, [assets, rebalanceMode]);
+
+      // --- 3. 處理單一資產「照做」邏輯 ---
+      const handleExecuteAction = (assetId, diffShares, action) => {
+        const newAssets = assets.map(a => {
+          if (a.id === assetId) {
+            // 與顯示的邏輯一致：買進無條件進位，賣出無條件捨去
+            const sharesToChange = action === 'BUY' ? Math.ceil(Math.abs(diffShares)) : -Math.floor(Math.abs(diffShares));
+            return { ...a, shares: Math.max(0, a.shares + sharesToChange) };
+          }
+          return a;
+        });
+        // 寫入 Firebase
+        database.ref('portfolio').set(newAssets);
+      };
+
+      // --- UI 控制邏輯 ---
+      const openSettings = () => {
+        setEditAssets(JSON.parse(JSON.stringify(assets)));
+        setIsSettingsOpen(true);
+      };
+
+      const handleInputChange = (id, field, value) => {
+        setEditAssets((prev) =>
+          prev.map((asset) => {
+            if (asset.id === id) {
+              let updatedValue = value;
+              if (field === 'symbol') updatedValue = value;
+              else updatedValue = value === '' ? '' : Number(value);
+              return { ...asset, [field]: updatedValue };
+            }
+            return asset;
+          })
+        );
+      };
+
+      const addNewAsset = () => {
+        const newId = Date.now().toString();
+        setEditAssets((prev) => [...prev, { id: newId, symbol: 'NEW', shares: 0, price: 0, targetPct: 0 }]);
+      };
+
+      const deleteAsset = (id) => {
+        setEditAssets((prev) => prev.filter((asset) => asset.id !== id));
+      };
+
+      const saveSettings = () => {
+        // 設定存檔時寫入 Firebase
+        database.ref('portfolio').set(editAssets);
+        setIsSettingsOpen(false);
+      };
+
+      // --- 繪製圓餅圖 ---
+      const renderPieChart = () => {
+        let accumulatedAngle = 0;
+        const radius = 80;
+        const cx = 100;
+        const cy = 100;
+
+        if (totalValue === 0) return <circle cx={cx} cy={cy} r={radius} fill="#e5e7eb" />;
+
+        return assetsWithMetrics.map((asset, index) => {
+          const pct = asset.currentPct / 100;
+          if (pct === 0) return null;
+          if (pct === 1) return <circle key={asset.id} cx={cx} cy={cy} r={radius} fill={COLORS[index % COLORS.length]} />;
+
+          const startAngle = accumulatedAngle;
+          const endAngle = accumulatedAngle + pct * 2 * Math.PI;
+          accumulatedAngle = endAngle;
+
+          const x1 = cx + radius * Math.cos(startAngle - Math.PI / 2);
+          const y1 = cy + radius * Math.sin(startAngle - Math.PI / 2);
+          const x2 = cx + radius * Math.cos(endAngle - Math.PI / 2);
+          const y2 = cy + radius * Math.sin(endAngle - Math.PI / 2);
+
+          const largeArcFlag = pct > 0.5 ? 1 : 0;
+          const pathData = `M ${cx} ${cy} L ${x1} ${y1} A ${radius} ${radius} 0 ${largeArcFlag} 1 ${x2} ${y2} Z`;
+
+          const midAngle = startAngle + (pct * Math.PI);
+          const labelRadius = radius * 0.65;
+          const lx = cx + labelRadius * Math.cos(midAngle - Math.PI / 2);
+          const ly = cy + labelRadius * Math.sin(midAngle - Math.PI / 2);
+
+          return (
+            <g key={asset.id}>
+              <path d={pathData} fill={COLORS[index % COLORS.length]} stroke="#ffffff" strokeWidth="1.5" />
+              {asset.currentPct > 5 && (
+                <text x={lx} y={ly} fill="#ffffff" fontSize="7" fontWeight="bold" textAnchor="middle" dominantBaseline="central">
+                  {asset.symbol} ({asset.currentPct.toFixed(1)}%)
+                </text>
+              )}
+            </g>
+          );
+        });
+      };
+
+      const editTargetPctSum = editAssets.reduce((sum, a) => sum + (a.targetPct || 0), 0);
+
+      return (
+        <div className="max-w-xl mx-auto min-h-screen bg-gray-50 text-gray-800 p-4 font-sans">
+          <header className="flex justify-between items-center pb-4 mb-4 border-b border-gray-200">
+            <h1 className="text-xl font-bold tracking-tight">資產動態平衡儀表板</h1>
+            <div className="flex space-x-2 items-center">
+              <button onClick={fetchRealTimePrices} disabled={isLoading} className={`flex items-center space-x-1 px-3 py-1.5 rounded-md text-xs font-bold transition-colors ${isLoading ? 'bg-gray-200 text-gray-400 cursor-wait' : 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100'}`}>
+                <span>{isLoading ? '更新中...' : '🔄 更新股價'}</span>
+              </button>
+              <button onClick={openSettings} className="p-2 text-gray-500 hover:text-gray-800 transition-colors">
+                ⚙️設定
+              </button>
+            </div>
+          </header>
+
+          {!isSettingsOpen && lastUpdated && (
+            <div className="text-right text-xs text-gray-400 mb-2">最後更新：{lastUpdated}</div>
+          )}
+
+          {!isSettingsOpen ? (
+            <div className="space-y-6">
+              <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 text-center">
+                <span className="text-sm text-gray-500 block mb-1">當前投資組合總價值 (TWD)</span>
+                <span className="text-3xl font-black text-indigo-600">
+                  ${totalValue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                </span>
+              </div>
+
+              <div className="flex justify-center py-2 bg-white rounded-xl shadow-sm border border-gray-100">
+                <svg width="200" height="200" viewBox="0 0 200 200" className="drop-shadow-sm">
+                  {renderPieChart()}
+                </svg>
+              </div>
+
+              <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                <div className="px-4 py-3 bg-gray-50 border-b border-gray-100 font-bold text-sm">現有資產明細</div>
+                <div className="divide-y divide-gray-100">
+                  {assetsWithMetrics.map((asset, index) => {
+                    const isUSStock = !/^\d{4,}/.test(asset.symbol);
+                    return (
+                      <div key={asset.id} className="p-4 flex justify-between items-center">
+                        <div className="flex items-center space-x-2">
+                          <span className="w-3 h-3 rounded-full inline-block" style={{ backgroundColor: COLORS[index % COLORS.length] }}/>
+                          <div>
+                            <div className="font-bold text-base">{asset.symbol}</div>
+                            <div className="text-xs text-gray-400">
+                              {asset.shares.toLocaleString()} 股 × ${asset.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              {isUSStock && " (已換匯)"}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <div className="font-semibold text-gray-900">
+                            ${asset.currentVal.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                          </div>
+                          <div className="text-xs space-x-1">
+                            <span className="text-gray-500">目前 {asset.currentPct.toFixed(1)}%</span>
+                            <span className="text-gray-300">|</span>
+                            <span className="text-indigo-600 font-medium">目標 {asset.targetPct}%</span>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className="font-bold text-gray-900 text-base">🔄 調整建議</h3>
+                  <div className="flex bg-gray-100 p-0.5 rounded-lg text-xs font-medium">
+                    <button onClick={() => setRebalanceMode('buySell')} className={`px-3 py-1.5 rounded-md transition-all ${rebalanceMode === 'buySell' ? 'bg-white shadow-sm text-indigo-600 font-bold' : 'text-gray-500'}`}>買賣平衡</button>
+                    <button onClick={() => setRebalanceMode('buyOnly')} className={`px-3 py-1.5 rounded-md transition-all ${rebalanceMode === 'buyOnly' ? 'bg-white shadow-sm text-indigo-600 font-bold' : 'text-gray-500'}`}>僅買不賣</button>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  {rebalanceResult.map((asset) => {
+                    const shares = Math.abs(asset.diffShares);
+                    const isHold = asset.action === 'HOLD' || shares === 0 || asset.price === 0;
+                    return (
+                      <div key={asset.id} className="flex justify-between items-center p-3 rounded-lg bg-gray-50 border border-gray-100">
+                        <div>
+                          <div className="font-bold text-sm text-gray-800">{asset.symbol}</div>
+                          <div className="text-xs text-gray-400">
+                            差異：<span className={asset.diffVal >= 0 ? "text-emerald-600" : "text-rose-600"}>{asset.diffVal >= 0 ? '+' : ''}${Math.round(asset.diffVal).toLocaleString()}</span>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          {isHold ? (
+                            <span className="text-xs font-semibold px-2 py-1 bg-gray-200 text-gray-600 rounded">維持現狀</span>
+                          ) : (
+                            <div className="flex items-center justify-end space-x-3">
+                              {asset.action === 'BUY' ? (
+                                <div className="text-sm font-bold text-emerald-600">買入 <span className="text-base font-black">{Math.ceil(shares).toLocaleString()}</span> 股</div>
+                              ) : (
+                                <div className="text-sm font-bold text-rose-600">賣出 <span className="text-base font-black">{Math.floor(shares).toLocaleString()}</span> 股</div>
+                              )}
+                              
+                              {/* 照做按鈕 */}
+                              <button 
+                                onClick={() => handleExecuteAction(asset.id, asset.diffShares, asset.action)}
+                                className="bg-indigo-100 hover:bg-indigo-600 text-indigo-700 hover:text-white transition-colors px-3 py-1.5 rounded text-xs font-bold shadow-sm"
+                              >
+                                照做
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {rebalanceMode === 'buyOnly' && (
+                  <div className="mt-4 pt-3 border-t border-dashed border-gray-200 flex justify-between items-center text-sm font-semibold text-gray-700">
+                    <span>估計需額外投入資金：</span>
+                    <span className="text-emerald-600 font-bold text-base">+${Math.round(additionalCashNeeded).toLocaleString()}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200 space-y-4">
+              <div className="flex justify-between items-center border-b border-gray-100 pb-2">
+                <h2 className="font-bold text-lg text-gray-900">⚙️ 修改參數</h2>
+                <button onClick={addNewAsset} className="text-xs bg-indigo-50 text-indigo-600 px-2.5 py-1.5 rounded-md font-bold">＋新增</button>
+              </div>
+              <div className="space-y-4">
+                {editAssets.map((asset) => (
+                  <div key={asset.id} className="p-3 bg-gray-50 rounded-lg border border-gray-200 relative">
+                    <button onClick={() => deleteAsset(asset.id)} className="absolute top-2 right-2 text-gray-400 hover:text-rose-500 text-xs p-1">✕</button>
+                    <div className="grid grid-cols-2 gap-2 mt-2">
+                      <div><label className="text-xs text-gray-400">代碼</label><input type="text" value={asset.symbol} onChange={(e) => handleInputChange(asset.id, 'symbol', e.target.value.toUpperCase())} className="w-full border px-2 py-1 text-sm font-bold" /></div>
+                      <div><label className="text-xs text-gray-400">目標權重 (%)</label><input type="number" value={asset.targetPct} onChange={(e) => handleInputChange(asset.id, 'targetPct', e.target.value)} className="w-full border px-2 py-1 text-sm" /></div>
+                      <div><label className="text-xs text-gray-400">持有股數</label><input type="number" value={asset.shares} onChange={(e) => handleInputChange(asset.id, 'shares', e.target.value)} className="w-full border px-2 py-1 text-sm" /></div>
+                      <div><label className="text-xs text-gray-400">股價</label><input type="number" value={asset.price} disabled className="w-full border px-2 py-1 text-sm bg-gray-100" /></div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="flex justify-between text-xs p-2.5 bg-gray-50 border">
+                <span>總計: <strong className={editTargetPctSum === 100 ? "text-emerald-600 text-sm" : "text-amber-600 text-sm"}>{editTargetPctSum}%</strong></span>
+              </div>
+              <div className="flex space-x-2 pt-2">
+                <button onClick={() => setIsSettingsOpen(false)} className="flex-1 py-2 border rounded-lg text-sm">取消</button>
+                <button onClick={saveSettings} disabled={editTargetPctSum !== 100} className={`flex-1 py-2 text-white rounded-lg text-sm font-bold ${editTargetPctSum === 100 ? 'bg-indigo-600' : 'bg-gray-300'}`}>儲存</button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<PortfolioRebalancer />);
+  </script>
+</body>
+</html>
